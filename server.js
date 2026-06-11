@@ -420,9 +420,18 @@ app.post('/api/utenti', admin, async (req,res) => {
   } catch(e) { res.status(400).json({error:'Email già esistente'}); }
 });
 app.patch('/api/utenti/:id', admin, async (req,res) => {
-  const{nome,cognome,ruolo,area,attivo,password}=req.body;
+  const{nome,cognome,email,ruolo,area,attivo,password}=req.body;
   if(password) await dbRun('UPDATE users SET password=? WHERE id=?',[bcrypt.hashSync(password,10),req.params.id]);
+  if(email) await dbRun('UPDATE users SET email=? WHERE id=?',[email.toLowerCase(),req.params.id]);
   await dbRun('UPDATE users SET nome=?,cognome=?,ruolo=?,area=?,attivo=? WHERE id=?',[nome,cognome,ruolo,area,attivo!==undefined?attivo:1,req.params.id]);
+  res.json({ok:true});
+});
+
+app.delete('/api/utenti/:id', admin, async (req,res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) return res.status(400).json({error:'ID non valido'});
+  if (id === req.session.userId) return res.status(400).json({error:'Non puoi eliminare te stesso'});
+  await dbRun('DELETE FROM users WHERE id=?',[id]);
   res.json({ok:true});
 });
 

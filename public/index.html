@@ -675,8 +675,9 @@ th.col-drop-target{background:var(--blue-lt)!important;border-left:2px solid var
       </div>
     </div>
     <div class="modal-foot">
+      <button class="btn btn-danger" id="btn-delete-user" style="display:none;margin-right:auto;" onclick="deleteUser()">Elimina utente</button>
       <button class="btn" onclick="closeModal('modal-user')">Annulla</button>
-      <button class="btn btn-primary" onclick="submitUser()">Crea utente</button>
+      <button class="btn btn-primary" id="btn-submit-user" onclick="submitUser()">Crea utente</button>
     </div>
   </div>
 </div>
@@ -1574,9 +1575,7 @@ async function loadUtenti() {
 }
 
 function openNewUser() {
-  ['nu-nome','nu-cognome','nu-email','nu-pwd'].forEach(id=>$(id).value='');
-  $('nu-ruolo').value='dipendente'; $('nu-area').value='';
-  $('user-modal-title').textContent='Nuovo utente';
+  resetUserModal();
   openModal('modal-user');
 }
 
@@ -1587,6 +1586,8 @@ async function editUser(id) {
   $('nu-email').value=u.email; $('nu-pwd').value='';
   $('nu-ruolo').value=u.ruolo; $('nu-area').value=u.area||'';
   $('user-modal-title').textContent='Modifica utente';
+  $('btn-submit-user').textContent='Salva modifiche';
+  $('btn-delete-user').style.display='inline-flex';
   $('modal-user').dataset.editId = id;
   openModal('modal-user');
 }
@@ -1610,6 +1611,32 @@ async function submitUser() {
     }
     delete $('modal-user').dataset.editId;
     closeModal('modal-user');
+    resetUserModal();
+    loadUtenti();
+    loadMasterData();
+  } catch(e) { toast('Errore: '+e.message); }
+}
+
+function resetUserModal() {
+  $('nu-nome').value=''; $('nu-cognome').value='';
+  $('nu-email').value=''; $('nu-pwd').value='';
+  $('nu-ruolo').value='dipendente'; $('nu-area').value='';
+  $('user-modal-title').textContent='Nuovo utente';
+  $('btn-submit-user').textContent='Crea utente';
+  $('btn-delete-user').style.display='none';
+  delete $('modal-user').dataset.editId;
+}
+
+async function deleteUser() {
+  const editId = $('modal-user').dataset.editId;
+  if (!editId) return;
+  const u = allUsers.find(x=>x.id===parseInt(editId));
+  if (!confirm(`Eliminare definitivamente ${u?.nome} ${u?.cognome}?`)) return;
+  try {
+    await api('DELETE', `/api/utenti/${editId}`);
+    toast('Utente eliminato');
+    closeModal('modal-user');
+    resetUserModal();
     loadUtenti();
     loadMasterData();
   } catch(e) { toast('Errore: '+e.message); }
