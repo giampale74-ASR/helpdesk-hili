@@ -800,6 +800,12 @@ app.get('/api/attivita/settimana', auth, async (req,res) => {
   res.json(rows);
 });
 
+// ── DEBUG temporaneo ──────────────────────────────────────────────────────────
+app.get('/api/debug/allegati', async (req,res) => {
+  const rows = await dbQuery('SELECT id, filename, originalname, ticket_id FROM allegati ORDER BY id DESC LIMIT 20');
+  res.json(rows);
+});
+
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
 
 initDB().then(()=>{
