@@ -23,23 +23,21 @@ const GOOGLE_CALLBACK_URL  = process.env.GOOGLE_CALLBACK_URL || 'https://hd.hili
 
 // ── Gmail / Nodemailer config ────────────────────────────────────────────────
 const gmailTransporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,
+  service: 'gmail',
   auth: {
+    type: 'OAuth2',
     user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_PASS,
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
   },
-  connectionTimeout: 15000,
-  greetingTimeout: 15000,
-  socketTimeout: 15000,
 });
 
 const FROM_EMAIL = `"Hili Help Desk" <${process.env.GMAIL_USER}>`;
 
 async function sendEmail(to, subject, html) {
-  if (!process.env.GMAIL_USER || !process.env.GMAIL_PASS) {
-    return console.log('[EMAIL] Gmail non configurato');
+  if (!process.env.GMAIL_USER || !process.env.GMAIL_REFRESH_TOKEN) {
+    return console.log('[EMAIL] Gmail OAuth2 non configurato');
   }
   if (!to) return;
   try {
