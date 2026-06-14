@@ -803,7 +803,13 @@ app.get('/api/attivita/settimana', auth, async (req,res) => {
 // ── DEBUG temporaneo ──────────────────────────────────────────────────────────
 app.get('/api/debug/allegati', async (req,res) => {
   const rows = await dbQuery('SELECT id, filename, originalname, ticket_id FROM allegati ORDER BY id DESC LIMIT 20');
-  res.json(rows);
+  res.json({
+    useCloudinary,
+    cloudinary_name: process.env.CLOUDINARY_CLOUD_NAME || 'NON IMPOSTATO',
+    cloudinary_key: process.env.CLOUDINARY_API_KEY ? 'OK' : 'NON IMPOSTATO',
+    cloudinary_secret: process.env.CLOUDINARY_API_SECRET ? 'OK' : 'NON IMPOSTATO',
+    allegati: rows
+  });
 });
 
 app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
