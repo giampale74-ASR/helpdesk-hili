@@ -591,14 +591,18 @@ app.post('/api/tickets/:id/allegati', auth, upload.array('files', 10), async (re
     let filename = file.filename || (Date.now() + '-' + file.originalname);
     let fileUrl = null;
 
+    console.log('[UPLOAD] useCloudinary:', useCloudinary, 'has buffer:', !!file.buffer, 'has path:', !!file.path, 'filename:', file.filename);
     if (useCloudinary && file.buffer) {
       try {
         const result = await uploadToCloudinary(file.buffer, filename, file.mimetype);
         filename = result.public_id;
         fileUrl  = result.secure_url;
+        console.log('[UPLOAD] Cloudinary OK:', fileUrl);
       } catch(e) {
-        console.error('Cloudinary upload error:', e.message);
+        console.error('[UPLOAD] Cloudinary error:', e.message);
       }
+    } else if (useCloudinary && !file.buffer) {
+      console.error('[UPLOAD] useCloudinary=true ma file.buffer mancante! file.fieldname:', file.fieldname);
     } else if (!useCloudinary && file.path) {
       fileUrl = `/uploads/${file.filename}`;
     }
