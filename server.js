@@ -588,13 +588,29 @@ app.post('/api/tickets/:id/allegati', auth, upload.array('files', 10), async (re
   const now = new Date().toISOString().replace('T',' ').slice(0,19);
   const inserted = [];
   for (const file of req.files) {
+    let filename = file.filename || (Date.now() + '-' + file.originalname);
+    let fileUrl = null;
+
+    if (useCloudinary && file.buffer) {
+      try {
+        const result = await uploadToCloudinary(file.buffer, filename, file.mimetype);
+        filename = result.public_id;
+        fileUrl  = result.secure_url;
+      } catch(e) {
+        console.error('Cloudinary upload error:', e.message);
+      }
+    } else if (!useCloudinary && file.path) {
+      fileUrl = `/uploads/${file.filename}`;
+    }
+
+    const fileSize = Number(file.size) || 0; // converti BigInt in Number per Turso
     const id = await dbRun(
       `INSERT INTO allegati (ticket_id,utente_id,filename,originalname,size,mimetype,creato_il) VALUES (?,?,?,?,?,?,?)`,
-      [ticketId, req.session.userId, file.filename, file.originalname, file.size, file.mimetype, now]
+      [ticketId, req.session.userId, fileUrl || filename, file.originalname, fileSize, file.mimetype, now]
     );
     await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
       [ticketId, req.session.userId, 'allegato', `Allegato aggiunto: ${file.originalname}`, now]);
-    inserted.push({ id, originalname: file.originalname, size: file.size });
+    inserted.push({ id, originalname: file.originalname, size: fileSize, url: fileUrl });
   }
   res.json({ ok: true, allegati: inserted });
 });
