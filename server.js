@@ -6,7 +6,6 @@ const bcrypt = require('bcryptjs');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
-const nodemailer = require('nodemailer');
 const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
 const passport = require('passport');
@@ -22,27 +21,66 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_CALLBACK_URL  = process.env.GOOGLE_CALLBACK_URL || 'https://hd.hilitravel.com/auth/google/callback';
 
 // ── Gmail / Nodemailer config ────────────────────────────────────────────────
-const gmailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    type: 'OAuth2',
-    user: process.env.GMAIL_USER,
-    clientId: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    refreshToken: process.env.GMAIL_REFRESH_TOKEN,
-  },
-});
+// ── Gmail API REST (HTTPS puro, non SMTP) ────────────────────────────────────
+async function getGmailAccessToken() {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id:     process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+      grant_type:    'refresh_token',
+    }),
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Token error: ' + JSON.stringify(data));
+  return data.access_token;
+}
+
+function makeRawEmail(to, from, subject, html) {
+  const boundary = 'boundary_' + Date.now();
+  const raw = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(subject).toString('base64')}?=`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html).toString('base64'),
+    `--${boundary}--`,
+  ].join('\r\n');
+  return Buffer.from(raw).toString('base64url');
+}
 
 const FROM_EMAIL = `"Hili Help Desk" <${process.env.GMAIL_USER}>`;
 
 async function sendEmail(to, subject, html) {
   if (!process.env.GMAIL_USER || !process.env.GMAIL_REFRESH_TOKEN) {
-    return console.log('[EMAIL] Gmail OAuth2 non configurato');
+    return console.log('[EMAIL] Gmail non configurato');
   }
   if (!to) return;
   try {
-    await gmailTransporter.sendMail({ from: FROM_EMAIL, to, subject, html });
-    console.log('[EMAIL] Inviata a:', to);
+    const accessToken = await getGmailAccessToken();
+    const raw = makeRawEmail(to, FROM_EMAIL, subject, html);
+    const res = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ raw }),
+    });
+    const data = await res.json();
+    if (data.id) {
+      console.log('[EMAIL] Inviata a:', to, 'id:', data.id);
+    } else {
+      console.error('[EMAIL] Errore API:', JSON.stringify(data));
+    }
   } catch(e) { console.error('[EMAIL] Errore:', e.message); }
 }
 

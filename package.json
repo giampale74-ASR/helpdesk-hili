@@ -17,8 +17,7 @@
     "multer": "^1.4.5-lts.1",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
-    "streamifier": "^0.1.1",
-    "nodemailer": "^6.9.14"
+    "streamifier": "^0.1.1"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
