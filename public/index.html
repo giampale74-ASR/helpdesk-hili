@@ -2437,9 +2437,9 @@ function loadColConfig() {
       if (!colOrder.includes(c.id)) colOrder.push(c.id);
     });
     colOrder = colOrder.filter(id => ALL_COLUMNS.find(c => c.id === id));
-    // Rimuovi fonte se ancora in colOrder dal vecchio localStorage
-    colOrder = colOrder.filter(id => id !== 'fonte');
   }
+  // Rimuovi sempre fonte indipendentemente da dove viene
+  colOrder = colOrder.filter(id => id !== 'fonte');
 }
 
 function saveColConfig() {
