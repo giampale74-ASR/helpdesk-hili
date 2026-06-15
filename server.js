@@ -84,6 +84,32 @@ async function sendEmail(to, subject, html) {
   } catch(e) { console.error('[EMAIL] Errore:', e.message); }
 }
 
+function emailNuovoTicket(utente, ticket, apertoDa) {
+  const prioColors = {critical:'#7C3AED',high:'#DC2626',medium:'#D97706',low:'#16A34A'};
+  const prioLabels = {critical:'Critical',high:'High',medium:'Medium',low:'Low'};
+  const colore = prioColors[ticket.priorita] || '#6B7280';
+  const prioLabel = prioLabels[ticket.priorita] || ticket.priorita;
+  return `
+    <div style="font-family:Inter,sans-serif;max-width:560px;margin:0 auto;background:#fff;border:1px solid #E5E7EB;border-radius:8px;overflow:hidden;">
+      <div style="background:#1E2433;padding:16px 24px;">
+        <span style="color:#fff;font-size:18px;font-weight:700;letter-spacing:1px;">HILI</span>
+        <span style="color:#94A3B8;font-size:12px;margin-left:8px;">Help Desk</span>
+      </div>
+      <div style="padding:24px;">
+        <p style="margin:0 0 8px;color:#374151;font-size:14px;">È stata aperta una nuova segnalazione da <strong>${apertoDa}</strong>.</p>
+        <div style="background:#F9FAFB;border:1px solid #E5E7EB;border-radius:6px;padding:16px;margin:16px 0;">
+          <div style="font-size:12px;color:#6B7280;margin-bottom:4px;">${ticket.codice} · ${ticket.area}</div>
+          <div style="font-size:15px;font-weight:600;color:#111827;margin-bottom:12px;">${ticket.titolo}</div>
+          <span style="display:inline-block;padding:4px 12px;border-radius:20px;background:${colore}22;color:${colore};font-size:12px;font-weight:700;">${prioLabel}</span>
+        </div>
+        <p style="margin:0;color:#6B7280;font-size:12px;">Accedi all'Help Desk per prendere in carico la segnalazione.</p>
+      </div>
+      <div style="background:#F9FAFB;padding:12px 24px;border-top:1px solid #E5E7EB;">
+        <p style="margin:0;color:#9CA3AF;font-size:11px;">Hili Travel — Help Desk Interno · Non rispondere a questa email</p>
+      </div>
+    </div>`;
+}
+
 function emailStatoTicket(utente, ticket, nuovoStato) {
   const statiLabel = {nuovo:'NEW',aperto:'OPEN',in_lavorazione:'IN PROGRESS',risolto:'RESOLVED',chiuso:'CLOSED'};
   const colori = {nuovo:'#2563EB',aperto:'#B45309',in_lavorazione:'#EA580C',risolto:'#166534',chiuso:'#6B7280'};
@@ -554,6 +580,17 @@ app.post('/api/tickets', auth, async (req,res) => {
   const id = await dbRun(`INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [codice,titolo,descrizione||'',area,fonte,categoria_id||null,priorita||'media','nuovo',req.session.userId,assegnato_a||null,now,now]);
   await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'creazione','Ticket creato',now]);
+
+  // Email notifica nuovo ticket agli admin/operatori
+  try {
+    const admins = await dbQuery("SELECT email FROM users WHERE ruolo IN ('admin','operatore') AND attivo=1 AND email IS NOT NULL");
+    const aperto_da = await dbQueryOne('SELECT nome,cognome FROM users WHERE id=?',[req.session.userId]);
+    const nomeApertura = aperto_da ? aperto_da.nome+' '+aperto_da.cognome : 'Un dipendente';
+    for (const admin of admins) {
+      sendEmail(admin.email, `[HD] Nuovo ticket ${codice}: ${titolo}`, emailNuovoTicket({nome:'Team'}, {codice, titolo, area, priorita:priorita||'medium'}, nomeApertura));
+    }
+  } catch(e) { console.error('Email nuovo ticket error:', e.message); }
+
   if(assegnato_a){
     const op = await dbQueryOne('SELECT nome,cognome FROM users WHERE id=?',[assegnato_a]);
     if(op) await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'assegnazione',`Assegnato a ${op.nome} ${op.cognome}`,now]);
