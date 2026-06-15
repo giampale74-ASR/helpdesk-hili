@@ -467,6 +467,10 @@ th.col-drop-target{background:var(--blue-lt)!important;border-left:2px solid var
         <svg viewBox="0 0 16 16" fill="none"><path d="M3 12h10M8 2v8M5 7l3 3 3-3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         Esporta dati
       </div>
+      <div class="nav-item" id="nav-importa" style="display:none;" onclick="openImportModal()">
+        <svg viewBox="0 0 16 16" fill="none"><path d="M3 12h10M8 14V6M5 9l3-3 3 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Importa dati
+      </div>
       <div class="nav-sec" id="nav-miei-sec" style="display:none;">I miei ticket</div>
       <div class="nav-item" id="nav-miei" style="display:none;" onclick="goPage('tickets',this,{assegnato_a:'me'})">
         <svg viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M2 13c0-2.8 2.7-5 6-5s6 2.2 6 5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
@@ -945,6 +949,34 @@ th.col-drop-target{background:var(--blue-lt)!important;border-left:2px solid var
   </div>
 </div>
 
+<!-- MODAL IMPORT -->
+<div class="modal-bg" id="modal-import">
+  <div class="modal" style="max-width:480px;">
+    <div class="modal-head">
+      <div class="modal-title">📥 Importa ticket da CSV</div>
+      <button class="icon-btn" onclick="closeModal('modal-import')">✕</button>
+    </div>
+    <div style="padding:20px;">
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px;">
+        Seleziona un file CSV esportato dall'Help Desk. I ticket verranno creati come nuovi — gli ID originali non vengono mantenuti.
+      </p>
+      <div class="form-group">
+        <label>File CSV</label>
+        <input type="file" id="import-file" accept=".csv" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--r-md);font-size:13px;">
+      </div>
+      <div id="import-preview" style="display:none;margin-top:12px;">
+        <div style="font-size:12px;color:var(--muted);margin-bottom:8px;">Anteprima:</div>
+        <div id="import-preview-text" style="font-size:12px;background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--border);max-height:150px;overflow-y:auto;"></div>
+      </div>
+      <div id="import-result" style="display:none;margin-top:12px;font-size:13px;"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('modal-import')">Annulla</button>
+      <button class="btn btn-primary" onclick="eseguiImport()">📥 Importa</button>
+    </div>
+  </div>
+</div>
+
 <!-- MODAL NUOVO UTENTE -->
 <div class="modal-bg" id="modal-user">
   <div class="modal">
@@ -1104,6 +1136,7 @@ function initApp() {
     $('nav-in-ritardo').style.display='';
     $('nav-report-sec').style.display='';
     $('nav-esporta').style.display='';
+    $('nav-importa').style.display='';
   }
   if (currentUser.ruolo === 'operatore') {
     $('nav-miei-sec').style.display='';
@@ -1112,7 +1145,7 @@ function initApp() {
   }
   if (currentUser.ruolo === 'dipendente') {
     // Nascondi sezioni non pertinenti
-    ['nav-tutti','nav-wip','nav-risolti','nav-area-sec','nav-fo','nav-bo','nav-mg','nav-it','nav-co','nav-non-assegnati','nav-in-ritardo','nav-report-sec','nav-esporta'].forEach(id => {
+    ['nav-tutti','nav-wip','nav-risolti','nav-area-sec','nav-fo','nav-bo','nav-mg','nav-it','nav-co','nav-non-assegnati','nav-in-ritardo','nav-report-sec','nav-esporta','nav-importa'].forEach(id => {
       const el = $(id); if (el) el.style.display='none';
     });
     // Mostra solo le proprie segnalazioni
@@ -1537,6 +1570,89 @@ async function toggleScreenRecordingUpd() {
 function stopRecordingUpd() {
   if (mediaRecorderUpd && mediaRecorderUpd.state === 'recording') mediaRecorderUpd.stop();
 }
+
+function openImportModal() {
+  $('import-file').value = '';
+  $('import-preview').style.display = 'none';
+  $('import-result').style.display = 'none';
+  openModal('modal-import');
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g,''));
+  return lines.slice(1).map(line => {
+    const vals = [];
+    let cur = '', inQ = false;
+    for (let i=0; i<line.length; i++) {
+      if (line[i]==='"') { inQ=!inQ; }
+      else if (line[i]===',' && !inQ) { vals.push(cur); cur=''; }
+      else cur += line[i];
+    }
+    vals.push(cur);
+    const obj = {};
+    headers.forEach((h,i) => obj[h] = (vals[i]||'').trim().replace(/^"|"$/g,''));
+    return obj;
+  });
+}
+
+async function eseguiImport() {
+  const file = $('import-file').files[0];
+  if (!file) { toast('Seleziona un file CSV'); return; }
+  const text = await file.text();
+  const rows = parseCSV(text);
+  if (rows.length === 0) { toast('File CSV vuoto o non valido'); return; }
+
+  $('import-result').style.display = '';
+  $('import-result').innerHTML = '<span style="color:var(--muted);">Importazione in corso...</span>';
+
+  // Mappa colonne CSV → campi API
+  const statoMap = {'NEW':'nuovo','OPEN':'aperto','IN PROGRESS':'in_lavorazione','RESOLVED':'risolto','CLOSED':'chiuso'};
+  const prioMap  = {'Critical':'critical','High':'high','Medium':'medium','Low':'low'};
+
+  let ok = 0, err = 0;
+  for (const row of rows) {
+    try {
+      await api('POST', '/api/tickets', {
+        titolo:      row['Titolo'] || row['titolo'] || 'Importato',
+        area:        row['Area']   || row['area']   || '',
+        fonte:       'Manuale',
+        priorita:    prioMap[row['Priorità']||row['priorita']] || 'medium',
+        stato:       statoMap[row['Stato']||row['stato']]      || 'nuovo',
+        descrizione: row['Note']  || row['descrizione'] || '',
+        categoria_id: null,
+        assegnato_a:  null,
+      });
+      ok++;
+    } catch(e) { err++; }
+  }
+
+  $('import-result').innerHTML =
+    '<div style="color:var(--green-dk);font-weight:600;">✓ Importati: ' + ok + ' ticket</div>' +
+    (err > 0 ? '<div style="color:var(--red-dk);">✗ Errori: ' + err + '</div>' : '');
+
+  if (ok > 0) {
+    toast(ok + ' ticket importati con successo');
+    loadTickets();
+    loadDashboard();
+    loadSidebarBadges();
+  }
+}
+
+// Anteprima file selezionato
+document.addEventListener('DOMContentLoaded', () => {
+  const fi = $('import-file');
+  if (fi) fi.addEventListener('change', async () => {
+    const file = fi.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const rows = parseCSV(text);
+    $('import-preview').style.display = '';
+    $('import-preview-text').textContent =
+      rows.length + ' righe trovate. Colonne: ' + Object.keys(rows[0]||{}).join(', ');
+  });
+});
 
 async function esportaTickets() {
   try {

@@ -591,14 +591,7 @@ app.patch('/api/tickets/:id', auth, async (req,res) => {
   }
   if(nota&&nota.trim()) {
     await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'nota',nota.trim(),now]);
-    // Email al dipendente per comunicazioni [Cliente]
-    if (nota.trim().startsWith('[Cliente]')) {
-      const tktData = await dbQueryOne(`SELECT t.codice,t.titolo,u.email,u.nome FROM ticket t JOIN users u ON t.aperto_da=u.id WHERE t.id=?`,[req.params.id]);
-      if (tktData && tktData.email) {
-        const msg = nota.trim().replace('[Cliente] ','').replace('[Cliente]','').trim();
-        sendEmail(tktData.email, `[HD] Nuova comunicazione su ${tktData.codice}`, emailComunicazione({nome:tktData.nome}, {codice:tktData.codice,titolo:tktData.titolo}, msg));
-      }
-    }
+    // Email per comunicazioni [Cliente] rimossa — solo cambio stato notifica via email
   }
   res.json({ok:true});
 });
