@@ -2269,12 +2269,22 @@ const ALL_FILTERS = [
 ];
 let filterOrder = null; // loaded from localStorage
 
+const FILTER_SCHEMA_VERSION = 2; // incrementa quando cambia ALL_FILTERS
+
 function loadFilterConfig() {
+  // Reset se schema è cambiato (es. fonte rimossa)
+  const savedFilterVersion = parseInt(localStorage.getItem('hd_filter_version')||'0');
+  if (savedFilterVersion !== FILTER_SCHEMA_VERSION) {
+    localStorage.removeItem('hd_filter_order');
+    localStorage.setItem('hd_filter_version', FILTER_SCHEMA_VERSION);
+  }
   try {
     const s = localStorage.getItem('hd_filter_order');
     if (s) filterOrder = JSON.parse(s);
   } catch(e) {}
   if (!filterOrder) filterOrder = ALL_FILTERS.map(f => ({id:f.id, visible:f.visible}));
+  // Rimuovi fonte se ancora presente dal vecchio localStorage
+  filterOrder = filterOrder.filter(f => f.id !== 'fonte');
 }
 
 function saveFilterConfig() {
@@ -2428,6 +2438,8 @@ function loadColConfig() {
       if (!colOrder.includes(c.id)) colOrder.push(c.id);
     });
     colOrder = colOrder.filter(id => ALL_COLUMNS.find(c => c.id === id));
+    // Rimuovi fonte se ancora in colOrder dal vecchio localStorage
+    colOrder = colOrder.filter(id => id !== 'fonte');
   }
 }
 
