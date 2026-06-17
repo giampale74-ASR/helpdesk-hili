@@ -14,24 +14,7 @@ const { createClient } = require('@libsql/client');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-let pool;
-const sqlConfig = {
-  server:   process.env.AZURE_SQL_SERVER,
-  database: process.env.AZURE_SQL_DATABASE,
-  authentication: {
-    type: 'default',
-    options: {
-      userName: process.env.AZURE_SQL_USER,
-      password: process.env.AZURE_SQL_PASSWORD,
-    }
-  },
-  options: {
-    encrypt: true,
-    trustServerCertificate: false,
-    connectionTimeout: 30000,
-    requestTimeout: 30000,
-  }
-};
+
 // ── Google OAuth config ───────────────────────────────────────────────────────
 const GOOGLE_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -225,6 +208,7 @@ const upload = multer({
 });
 
 // ── Database Turso ────────────────────────────────────────────────────────────
+let db;
 
 const dbQuery = async (sql, params = []) => {
   const result = await db.execute({ sql, args: params });
