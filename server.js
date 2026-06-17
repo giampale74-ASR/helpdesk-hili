@@ -209,6 +209,11 @@ const upload = multer({
 // Connection pool (singleton)
 let pool;
 
+// ── Ora italiana (UTC+2 estate / UTC+1 inverno) ───────────────────────────────
+function nowIT() {
+  return new Date().toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace('T', ' ').slice(0, 19);
+}
+
 const azureSqlConfig = {
   server:   process.env.AZURE_SQL_SERVER,   // e.g. myserver.database.windows.net
   database: process.env.AZURE_SQL_DATABASE,
@@ -428,7 +433,7 @@ async function initDB() {
     for (const n of ['Cuffie','Telefono / SIM','Stampante','PC / Monitor']) await cat('Hardware',n);
     for (const n of ['Accessi e badge','Procedure interne','Richieste generali']) await cat('Altro',n);
 
-    const ago = m => { const d=new Date(Date.now()-m*60000); return d.toISOString().replace('T',' ').slice(0,19); };
+    const ago = m => { return new Date(Date.now()-m*60000).toLocaleString('sv-SE', { timeZone: 'Europe/Rome' }).replace('T',' ').slice(0,19); };
     const it = (cod,tit,des,area,fonte,cid,prio,stato,apertoDa,assegnatoA,ts) =>
       dbInsert(`INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [cod,tit,des,area,fonte,cid,prio,stato,apertoDa,assegnatoA,ts,ts]);
@@ -660,7 +665,7 @@ app.post('/api/tickets', auth, async (req,res) => {
   const lastCodice = await dbQueryOne("SELECT MAX(CAST(SUBSTRING(codice,4,10) AS INT)) AS n FROM ticket WHERE codice LIKE 'HD-%'");
   const nextN = (lastCodice && lastCodice.n ? lastCodice.n : 0) + 1;
   const codice = 'HD-' + String(nextN).padStart(4,'0');
-  const now=new Date().toISOString().replace('T',' ').slice(0,19);
+  const now=nowIT();
   const id = await dbInsert(
     `INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [codice,titolo,descrizione||'',area,fonte,categoria_id||null,priorita||'media','nuovo',req.session.userId,assegnato_a||null,now,now]);
@@ -687,7 +692,7 @@ app.patch('/api/tickets/:id', auth, async (req,res) => {
   const {stato,assegnato_a,priorita,nota}=req.body;
   const t = await dbQueryOne('SELECT * FROM ticket WHERE id=?',[req.params.id]);
   if(!t) return res.status(404).json({error:'Non trovato'});
-  const now=new Date().toISOString().replace('T',' ').slice(0,19);
+  const now=nowIT();
   if(stato&&stato!==t.stato){
     const risolto=['risolto','chiuso'].includes(stato)?now:t.risolto_il;
     await dbRun(`UPDATE ticket SET stato=?,aggiornato_il=?,risolto_il=? WHERE id=?`,[stato,now,risolto,req.params.id]);
@@ -739,7 +744,7 @@ app.post('/api/tickets/:id/allegati', auth, upload.array('files', 10), async (re
   const t = await dbQueryOne('SELECT id FROM ticket WHERE id=?', [ticketId]);
   if (!t) return res.status(404).json({ error: 'Ticket non trovato' });
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'Nessun file caricato' });
-  const now = new Date().toISOString().replace('T',' ').slice(0,19);
+  const now = nowIT();
   const inserted = [];
   for (const file of req.files) {
     let filename = file.filename || (Date.now() + '-' + file.originalname);
@@ -823,7 +828,7 @@ app.delete('/api/allegati/:id', auth, async (req, res) => {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }
   await dbRun('DELETE FROM allegati WHERE id=?', [parseInt(req.params.id, 10)]);
-  const now = new Date().toISOString().replace('T',' ').slice(0,19);
+  const now = nowIT();
   await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
     [a.ticket_id, req.session.userId, 'allegato', `Allegato rimosso: ${a.originalname}`, now]);
   res.json({ ok: true });
@@ -979,7 +984,7 @@ app.post('/api/feedback', auth, async (req,res) => {
       `);
     const inserted = await dbQueryOne('SELECT id FROM feedback WHERE ticket_id=?',[ticket_id]);
     const id = inserted ? inserted.id : null;
-    const now = new Date().toISOString().replace('T',' ').slice(0,19);
+    const now = nowIT();
     const stelle = '★'.repeat(voto) + '☆'.repeat(5-voto);
     await dbInsert('INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)',
       [ticket_id, req.session.userId, 'feedback', `Valutazione: ${stelle} (${voto}/5)`, now]);
