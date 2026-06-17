@@ -10,7 +10,7 @@ const cloudinary = require('cloudinary').v2;
 const streamifier = require('streamifier');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
-const sql = require('mssql');
+const { createClient } = require('@libsql/client');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -21,6 +21,7 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GOOGLE_CALLBACK_URL  = process.env.GOOGLE_CALLBACK_URL || 'https://hd.hilitravel.com/auth/google/callback';
 
 // ── Gmail / Nodemailer config ────────────────────────────────────────────────
+// ── Gmail API REST (HTTPS puro, non SMTP) ────────────────────────────────────
 async function getGmailAccessToken() {
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
@@ -182,6 +183,7 @@ const uploadToCloudinary = (buffer, filename, mimetype) => {
 const uploadsDir = path.join(__dirname, 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true });
 
+// Usa memoria per Cloudinary, disco come fallback locale
 const useCloudinary = !!(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY);
 
 const storage = useCloudinary
@@ -205,214 +207,128 @@ const upload = multer({
   }
 });
 
-// ── Database Azure SQL ────────────────────────────────────────────────────────
-// Connection pool (singleton)
-let pool;
+// ── Database Turso ────────────────────────────────────────────────────────────
+let db;
 
-const azureSqlConfig = {
-  server:   process.env.AZURE_SQL_SERVER,   // e.g. myserver.database.windows.net
-  database: process.env.AZURE_SQL_DATABASE,
-  user:     process.env.AZURE_SQL_USER,
-  password: process.env.AZURE_SQL_PASSWORD,
-  port:     parseInt(process.env.AZURE_SQL_PORT || '1433', 10),
-  options: {
-    encrypt: true,              // required for Azure SQL
-    trustServerCertificate: false,
-  },
-  pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000,
-  },
+const dbQuery = async (sql, params = []) => {
+  const result = await db.execute({ sql, args: params });
+  return result.rows.map(row => {
+    const obj = {};
+    result.columns.forEach((col, i) => { obj[col] = row[i]; });
+    return obj;
+  });
+};
+const dbQueryOne = async (sql, params = []) => {
+  const rows = await dbQuery(sql, params);
+  return rows[0] || null;
+};
+const dbRun = async (sql, params = []) => {
+  const result = await db.execute({ sql, args: params });
+  return Number(result.lastInsertRowid) || null;
 };
 
-// ── DB helpers ────────────────────────────────────────────────────────────────
-// Converts positional ? placeholders to named @p0, @p1, ... for mssql
-function buildRequest(transaction) {
-  return transaction ? transaction.request() : pool.request();
-}
-
-// Normalize a value returned by mssql: convert Date objects → "YYYY-MM-DD HH:mm:ss" strings
-function normalizeVal(v) {
-  if (v instanceof Date) {
-    const pad = n => String(n).padStart(2, '0');
-    return `${v.getFullYear()}-${pad(v.getMonth()+1)}-${pad(v.getDate())} ${pad(v.getHours())}:${pad(v.getMinutes())}:${pad(v.getSeconds())}`;
-  }
-  return v;
-}
-
-async function dbQuery(sqlText, params = []) {
-  const req = buildRequest();
-  // Replace ? with @p0, @p1, ...
-  let i = 0;
-  const namedSql = sqlText.replace(/\?/g, () => `@p${i++}`);
-  params.forEach((v, idx) => req.input(`p${idx}`, v !== undefined ? v : null));
-  const result = await req.query(namedSql);
-  // Normalize Date objects → strings so the frontend always gets "YYYY-MM-DD HH:mm:ss"
-  return (result.recordset || []).map(row => {
-    const out = {};
-    for (const key of Object.keys(row)) out[key] = normalizeVal(row[key]);
-    return out;
-  });
-}
-
-async function dbQueryOne(sqlText, params = []) {
-  const rows = await dbQuery(sqlText, params);
-  return rows[0] || null;
-}
-
-// Returns the last inserted ID (uses OUTPUT INSERTED.id pattern when needed)
-// For INSERT statements, caller should use dbInsert; dbRun for non-INSERT DML.
-async function dbRun(sqlText, params = []) {
-  const req = buildRequest();
-  let i = 0;
-  const namedSql = sqlText.replace(/\?/g, () => `@p${i++}`);
-  params.forEach((v, idx) => req.input(`p${idx}`, v !== undefined ? v : null));
-  const result = await req.query(namedSql);
-  // For INSERT ... OUTPUT INSERTED.id
-  if (result.recordset && result.recordset.length > 0 && result.recordset[0].id !== undefined) {
-    return Number(result.recordset[0].id);
-  }
-  return null;
-}
-
-// Helper: INSERT and return new ID using OUTPUT INSERTED.id
-// Rewrites:  INSERT INTO t (cols) VALUES (...)  →  INSERT INTO t (cols) OUTPUT INSERTED.id VALUES (...)
-async function dbInsert(sqlText, params = []) {
-  // Inject OUTPUT INSERTED.id after table name + columns, before VALUES
-  const insertSql = sqlText.replace(
-    /^(INSERT\s+INTO\s+\S+\s*(?:\([^)]*\))?)\s*(VALUES)/i,
-    '$1 OUTPUT INSERTED.id $2'
-  );
-  return dbRun(insertSql, params);
-}
-
 async function initDB() {
-  pool = await sql.connect(azureSqlConfig);
+  db = createClient({
+    url:       process.env.TURSO_DATABASE_URL,
+    authToken: process.env.TURSO_AUTH_TOKEN,
+  });
 
   // ── Schema ────────────────────────────────────────────────────────────────────
-  await pool.request().query(`
-    IF OBJECT_ID('users','U') IS NULL
-    CREATE TABLE users (
-      id        INT IDENTITY(1,1) PRIMARY KEY,
-      nome      NVARCHAR(100) NOT NULL,
-      cognome   NVARCHAR(100) NOT NULL,
-      email     NVARCHAR(255) NOT NULL UNIQUE,
-      password  NVARCHAR(255) NOT NULL,
-      ruolo     NVARCHAR(50)  NOT NULL DEFAULT 'operatore',
-      area      NVARCHAR(100),
-      attivo    BIT           NOT NULL DEFAULT 1,
-      creato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss'))
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('categorie','U') IS NULL
-    CREATE TABLE categorie (
-      id     INT IDENTITY(1,1) PRIMARY KEY,
-      tipo   NVARCHAR(50)  NOT NULL,
-      nome   NVARCHAR(100) NOT NULL,
-      attivo BIT           NOT NULL DEFAULT 1
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('ticket','U') IS NULL
-    CREATE TABLE ticket (
-      id            INT IDENTITY(1,1) PRIMARY KEY,
-      codice        NVARCHAR(20)  NOT NULL UNIQUE,
-      titolo        NVARCHAR(255) NOT NULL,
-      descrizione   NVARCHAR(MAX),
-      area          NVARCHAR(100) NOT NULL,
-      fonte         NVARCHAR(50)  NOT NULL,
-      categoria_id  INT,
-      priorita      NVARCHAR(20)  NOT NULL DEFAULT 'media',
-      stato         NVARCHAR(30)  NOT NULL DEFAULT 'nuovo',
-      aperto_da     INT,
-      assegnato_a   INT,
-      creato_il     NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss')),
-      aggiornato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss')),
-      risolto_il    NVARCHAR(20)
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('attivita','U') IS NULL
-    CREATE TABLE attivita (
-      id        INT IDENTITY(1,1) PRIMARY KEY,
-      ticket_id INT           NOT NULL,
-      utente_id INT,
-      tipo      NVARCHAR(30)  NOT NULL,
-      testo     NVARCHAR(MAX) NOT NULL,
-      creato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss'))
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('aree','U') IS NULL
-    CREATE TABLE aree (
-      id     INT IDENTITY(1,1) PRIMARY KEY,
-      nome   NVARCHAR(100) NOT NULL UNIQUE,
-      ordine INT           NOT NULL DEFAULT 0,
-      attivo BIT           NOT NULL DEFAULT 1
-    )`);
-
+  await dbRun(`CREATE TABLE IF NOT EXISTS users (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome      TEXT NOT NULL,
+    cognome   TEXT NOT NULL,
+    email     TEXT NOT NULL UNIQUE,
+    password  TEXT NOT NULL,
+    ruolo     TEXT NOT NULL DEFAULT 'operatore',
+    area      TEXT,
+    attivo    INTEGER NOT NULL DEFAULT 1,
+    creato_il TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS categorie (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    tipo   TEXT NOT NULL,
+    nome   TEXT NOT NULL,
+    attivo INTEGER NOT NULL DEFAULT 1
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS ticket (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    codice        TEXT NOT NULL UNIQUE,
+    titolo        TEXT NOT NULL,
+    descrizione   TEXT,
+    area          TEXT NOT NULL,
+    fonte         TEXT NOT NULL,
+    categoria_id  INTEGER,
+    priorita      TEXT NOT NULL DEFAULT 'media',
+    stato         TEXT NOT NULL DEFAULT 'nuovo',
+    aperto_da     INTEGER,
+    assegnato_a   INTEGER,
+    creato_il     TEXT NOT NULL DEFAULT (datetime('now')),
+    aggiornato_il TEXT NOT NULL DEFAULT (datetime('now')),
+    risolto_il    TEXT
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS attivita (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL,
+    utente_id INTEGER,
+    tipo      TEXT NOT NULL,
+    testo     TEXT NOT NULL,
+    creato_il TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS aree (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome      TEXT NOT NULL UNIQUE,
+    ordine    INTEGER NOT NULL DEFAULT 0,
+    attivo    INTEGER NOT NULL DEFAULT 1
+  )`);
   // Seed aree di default se vuote
-  const cntAree = await dbQueryOne('SELECT COUNT(*) AS c FROM aree');
+  const cntAree = await dbQueryOne('SELECT COUNT(*) as c FROM aree');
   if (!cntAree || cntAree.c === 0) {
-    for (const [i, a] of ['Front Office','Back Office','Management','IT / Guide','Commerciale'].entries()) {
-      await dbInsert('INSERT INTO aree (nome,ordine) VALUES (?,?)', [a, i]);
+    for (const [i,a] of ['Front Office','Back Office','Management','IT / Guide','Commerciale'].entries()) {
+      await dbRun('INSERT INTO aree (nome,ordine) VALUES (?,?)',[a,i]);
     }
   }
-
-  await pool.request().query(`
-    IF OBJECT_ID('annunci','U') IS NULL
-    CREATE TABLE annunci (
-      id        INT IDENTITY(1,1) PRIMARY KEY,
-      titolo    NVARCHAR(255) NOT NULL,
-      testo     NVARCHAR(MAX) NOT NULL,
-      attivo    BIT           NOT NULL DEFAULT 1,
-      creato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss')),
-      creato_da INT
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('faq','U') IS NULL
-    CREATE TABLE faq (
-      id        INT IDENTITY(1,1) PRIMARY KEY,
-      domanda   NVARCHAR(MAX) NOT NULL,
-      risposta  NVARCHAR(MAX) NOT NULL,
-      ordine    INT           NOT NULL DEFAULT 0,
-      attivo    BIT           NOT NULL DEFAULT 1,
-      creato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss'))
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('feedback','U') IS NULL
-    CREATE TABLE feedback (
-      id        INT IDENTITY(1,1) PRIMARY KEY,
-      ticket_id INT           NOT NULL UNIQUE,
-      utente_id INT           NOT NULL,
-      voto      INT           NOT NULL,
-      commento  NVARCHAR(MAX),
-      creato_il NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss'))
-    )`);
-
-  await pool.request().query(`
-    IF OBJECT_ID('allegati','U') IS NULL
-    CREATE TABLE allegati (
-      id           INT IDENTITY(1,1) PRIMARY KEY,
-      ticket_id    INT           NOT NULL,
-      utente_id    INT,
-      filename     NVARCHAR(500) NOT NULL,
-      originalname NVARCHAR(255) NOT NULL,
-      size         BIGINT        NOT NULL,
-      mimetype     NVARCHAR(100),
-      creato_il    NVARCHAR(20)  NOT NULL DEFAULT (FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss'))
-    )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS annunci (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    titolo    TEXT NOT NULL,
+    testo     TEXT NOT NULL,
+    attivo    INTEGER NOT NULL DEFAULT 1,
+    creato_il TEXT NOT NULL DEFAULT (datetime('now')),
+    creato_da INTEGER
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS faq (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    domanda   TEXT NOT NULL,
+    risposta  TEXT NOT NULL,
+    ordine    INTEGER NOT NULL DEFAULT 0,
+    attivo    INTEGER NOT NULL DEFAULT 1,
+    creato_il TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS feedback (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER NOT NULL UNIQUE,
+    utente_id INTEGER NOT NULL,
+    voto      INTEGER NOT NULL,
+    commento  TEXT,
+    creato_il TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
+  await dbRun(`CREATE TABLE IF NOT EXISTS allegati (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id    INTEGER NOT NULL,
+    utente_id    INTEGER,
+    filename     TEXT NOT NULL,
+    originalname TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    mimetype     TEXT,
+    creato_il    TEXT NOT NULL DEFAULT (datetime('now'))
+  )`);
 
   // ── Seed demo ─────────────────────────────────────────────────────────────────
-  const cnt = await dbQueryOne('SELECT COUNT(*) AS c FROM users');
+  const cnt = await dbQueryOne('SELECT COUNT(*) as c FROM users');
   if (!cnt || cnt.c === 0) {
     const hA = bcrypt.hashSync('admin123', 10);
     const hO = bcrypt.hashSync('operatore123', 10);
-    const u = (n,c,e,p,r,a) => dbInsert('INSERT INTO users (nome,cognome,email,password,ruolo,area) VALUES (?,?,?,?,?,?)',[n,c,e,p,r,a]);
+    const u = (n,c,e,p,r,a) => dbRun('INSERT INTO users (nome,cognome,email,password,ruolo,area) VALUES (?,?,?,?,?,?)',[n,c,e,p,r,a]);
     await u('Admin','Sistema','admin@helpdesk.it',hA,'admin',null);
     await u('Sara','Rossi','sara.r@helpdesk.it',hO,'operatore','Back Office');
     await u('Luca','Mancini','luca.m@helpdesk.it',hO,'operatore','IT / Guide');
@@ -423,17 +339,17 @@ async function initDB() {
     await u('Chiara','Verdi','chiara.v@helpdesk.it',hO,'dipendente','IT / Guide');
     await u('Paolo','Sorrentino','paolo.s@helpdesk.it',hO,'dipendente','Commerciale');
 
-    const cat = (t,n) => dbInsert('INSERT INTO categorie (tipo,nome) VALUES (?,?)',[t,n]);
+    const cat = (t,n) => dbRun('INSERT INTO categorie (tipo,nome) VALUES (?,?)',[t,n]);
     for (const n of ['Sistema HSW','WhatsApp Business','Talkdesk','Email / Outlook']) await cat('Software',n);
     for (const n of ['Cuffie','Telefono / SIM','Stampante','PC / Monitor']) await cat('Hardware',n);
     for (const n of ['Accessi e badge','Procedure interne','Richieste generali']) await cat('Altro',n);
 
     const ago = m => { const d=new Date(Date.now()-m*60000); return d.toISOString().replace('T',' ').slice(0,19); };
     const it = (cod,tit,des,area,fonte,cid,prio,stato,apertoDa,assegnatoA,ts) =>
-      dbInsert(`INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      dbRun(`INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
         [cod,tit,des,area,fonte,cid,prio,stato,apertoDa,assegnatoA,ts,ts]);
     const ia = (tid,uid,tipo,testo,ts) =>
-      dbInsert('INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)',[tid,uid,tipo,testo,ts]);
+      dbRun('INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)',[tid,uid,tipo,testo,ts]);
 
     const t1=await it('HD-0042','Blocco accesso gestionale','Non riesco ad accedere al gestionale. Errore: sessione scaduta.','Front Office','Slack',1,'alta','nuovo',7,2,ago(2));
     await ia(t1,7,'creazione','Segnalazione ricevuta via Slack',ago(2));
@@ -452,13 +368,12 @@ async function initDB() {
 
     console.log('✓ Dati demo inizializzati');
   }
-
   // ── Migrazione priorità vecchie → nuove ──────────────────────────────────────
   await dbRun("UPDATE ticket SET priorita='critical' WHERE priorita='massima'");
   await dbRun("UPDATE ticket SET priorita='high'     WHERE priorita='alta'");
   await dbRun("UPDATE ticket SET priorita='medium'   WHERE priorita='media'");
   await dbRun("UPDATE ticket SET priorita='low'      WHERE priorita='bassa'");
-  console.log('✓ Database Azure SQL pronto');
+  console.log('✓ Database Turso pronto');
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
@@ -535,10 +450,9 @@ app.get('/auth/google/callback',
 // ── Tickets ───────────────────────────────────────────────────────────────────
 app.get('/api/tickets', auth, async (req,res) => {
   const {area,stato,priorita,q,assegnato_a,aperto_da,fonte}=req.query;
-  // NOTE: SQL Server string concatenation uses + instead of ||
-  let sqlText=`SELECT t.*,c.tipo as cat_tipo,c.nome as cat_nome,
-    u1.nome+' '+u1.cognome as aperto_da_nome,
-    u2.nome+' '+u2.cognome as assegnato_a_nome,
+  let sql=`SELECT t.*,c.tipo as cat_tipo,c.nome as cat_nome,
+    u1.nome||' '||u1.cognome as aperto_da_nome,
+    u2.nome||' '||u2.cognome as assegnato_a_nome,
     (SELECT COUNT(*) FROM allegati a WHERE a.ticket_id=t.id) as n_allegati
     FROM ticket t
     LEFT JOIN categorie c ON t.categoria_id=c.id
@@ -547,24 +461,24 @@ app.get('/api/tickets', auth, async (req,res) => {
   const p=[];
   const me = await dbQueryOne('SELECT ruolo FROM users WHERE id=?',[req.session.userId]);
   if (me && me.ruolo === 'dipendente') {
-    sqlText+=' AND t.aperto_da=?'; p.push(req.session.userId);
-    if(stato){sqlText+=' AND t.stato=?';p.push(stato);}
-    if(q){sqlText+=' AND (t.titolo LIKE ? OR t.codice LIKE ? OR t.descrizione LIKE ?)';const s='%'+q+'%';p.push(s,s,s);}
+    sql+=' AND t.aperto_da=?'; p.push(req.session.userId);
+    if(stato){sql+=' AND t.stato=?';p.push(stato);}
+    if(q){sql+=' AND (t.titolo LIKE ? OR t.codice LIKE ? OR t.descrizione LIKE ?)';const s='%'+q+'%';p.push(s,s,s);}
   } else {
-    if(area){sqlText+=' AND t.area=?';p.push(area);}
-    if(stato){sqlText+=' AND t.stato=?';p.push(stato);}
-    if(priorita){sqlText+=' AND t.priorita=?';p.push(priorita);}
-    if(fonte){sqlText+=' AND t.fonte=?';p.push(fonte);}
-    if(assegnato_a){sqlText+=' AND t.assegnato_a=?';p.push(parseInt(assegnato_a,10));}
-    if(aperto_da){sqlText+=' AND t.aperto_da=?';p.push(parseInt(aperto_da,10));}
-    if(q){sqlText+=' AND (t.titolo LIKE ? OR t.codice LIKE ? OR t.descrizione LIKE ?)';const s='%'+q+'%';p.push(s,s,s);}
+    if(area){sql+=' AND t.area=?';p.push(area);}
+    if(stato){sql+=' AND t.stato=?';p.push(stato);}
+    if(priorita){sql+=' AND t.priorita=?';p.push(priorita);}
+    if(fonte){sql+=' AND t.fonte=?';p.push(fonte);}
+    if(assegnato_a){sql+=' AND t.assegnato_a=?';p.push(parseInt(assegnato_a,10));}
+    if(aperto_da){sql+=' AND t.aperto_da=?';p.push(parseInt(aperto_da,10));}
+    if(q){sql+=' AND (t.titolo LIKE ? OR t.codice LIKE ? OR t.descrizione LIKE ?)';const s='%'+q+'%';p.push(s,s,s);}
   }
-  sqlText+=` ORDER BY CASE t.priorita WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.creato_il DESC`;
-  res.json(await dbQuery(sqlText,p));
+  sql+=` ORDER BY CASE t.priorita WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.creato_il DESC`;
+  res.json(await dbQuery(sql,p));
 });
 
 app.get('/api/tickets/count', auth, async (req,res) => {
-  const row = await dbQueryOne('SELECT COUNT(*) AS c, MAX(id) AS last_id FROM ticket');
+  const row = await dbQueryOne('SELECT COUNT(*) as c, MAX(id) as last_id FROM ticket');
   res.json({ count: row.c, last_id: row.last_id || 0 });
 });
 
@@ -579,7 +493,7 @@ app.get('/api/attivita/latest', auth, async (req,res) => {
     rows = await dbQuery(
       `SELECT a.id, a.tipo, a.testo, a.creato_il, a.ticket_id, a.utente_id,
         t.codice, t.titolo,
-        u.nome+' '+u.cognome AS utente_nome
+        u.nome || ' ' || u.cognome as utente_nome
        FROM attivita a
        JOIN ticket t ON t.id = a.ticket_id
        LEFT JOIN users u ON u.id = a.utente_id
@@ -594,7 +508,7 @@ app.get('/api/attivita/latest', auth, async (req,res) => {
     rows = await dbQuery(
       `SELECT a.id, a.tipo, a.testo, a.creato_il, a.ticket_id, a.utente_id,
         t.codice, t.titolo,
-        u.nome+' '+u.cognome AS utente_nome
+        u.nome || ' ' || u.cognome as utente_nome
        FROM attivita a
        JOIN ticket t ON t.id = a.ticket_id
        LEFT JOIN users u ON u.id = a.utente_id
@@ -606,6 +520,7 @@ app.get('/api/attivita/latest', auth, async (req,res) => {
     );
   }
 
+  // Restituisce tutte le attività nuove
   const last_activity_id = rows.length > 0 ? Number(rows[rows.length-1].id) : sinceId;
   res.json({ last_activity_id, activities: rows });
 });
@@ -616,6 +531,7 @@ app.delete('/api/tickets/bulk', admin, async (req,res) => {
   if (!ids || !Array.isArray(ids) || ids.length === 0)
     return res.status(400).json({error:'Nessun ticket specificato'});
   for (const id of ids) {
+    // Elimina allegati, attività e il ticket
     const allegati = await dbQuery('SELECT * FROM allegati WHERE ticket_id=?',[id]);
     for (const a of allegati) {
       if (useCloudinary && a.filename && a.filename.includes('helpdesk/')) {
@@ -634,8 +550,8 @@ app.get('/api/tickets/:id', auth, async (req,res) => {
   const tid = parseInt(req.params.id, 10);
   if (isNaN(tid)) return res.status(400).json({error:'ID non valido'});
   const t = await dbQueryOne(`SELECT t.*,c.tipo as cat_tipo,c.nome as cat_nome,
-    u1.nome+' '+u1.cognome AS aperto_da_nome,
-    u2.nome+' '+u2.cognome AS assegnato_a_nome
+    u1.nome||' '||u1.cognome as aperto_da_nome,
+    u2.nome||' '||u2.cognome as assegnato_a_nome
     FROM ticket t LEFT JOIN categorie c ON t.categoria_id=c.id
     LEFT JOIN users u1 ON t.aperto_da=u1.id LEFT JOIN users u2 ON t.assegnato_a=u2.id
     WHERE t.id=?`,[tid]);
@@ -644,10 +560,10 @@ app.get('/api/tickets/:id', auth, async (req,res) => {
   if (meCheck && meCheck.ruolo === 'dipendente' && t.aperto_da !== req.session.userId) {
     return res.status(403).json({error:'Accesso negato'});
   }
-  const attivita = await dbQuery(`SELECT a.*,u.nome+' '+u.cognome AS utente_nome
+  const attivita = await dbQuery(`SELECT a.*,u.nome||' '||u.cognome as utente_nome
     FROM attivita a LEFT JOIN users u ON a.utente_id=u.id
     WHERE a.ticket_id=? ORDER BY a.creato_il ASC`,[tid]);
-  const allegati = await dbQuery(`SELECT al.*,u.nome+' '+u.cognome AS utente_nome
+  const allegati = await dbQuery(`SELECT al.*,u.nome||' '||u.cognome as utente_nome
     FROM allegati al LEFT JOIN users u ON al.utente_id=u.id
     WHERE al.ticket_id=? ORDER BY al.creato_il ASC`,[tid]);
   res.json({...t, attivita, allegati});
@@ -656,29 +572,28 @@ app.get('/api/tickets/:id', auth, async (req,res) => {
 app.post('/api/tickets', auth, async (req,res) => {
   const {titolo,descrizione,area,fonte,categoria_id,priorita,assegnato_a}=req.body;
   if(!titolo||!area||!fonte) return res.status(400).json({error:'Campi obbligatori mancanti'});
-  // Use MAX(codice) to avoid duplicates
-  const lastCodice = await dbQueryOne("SELECT MAX(CAST(SUBSTRING(codice,4,10) AS INT)) AS n FROM ticket WHERE codice LIKE 'HD-%'");
+  // Usa MAX(codice) per evitare duplicati
+  const lastCodice = await dbQueryOne("SELECT MAX(CAST(SUBSTR(codice,4) AS INTEGER)) as n FROM ticket WHERE codice LIKE 'HD-%'");
   const nextN = (lastCodice && lastCodice.n ? lastCodice.n : 0) + 1;
   const codice = 'HD-' + String(nextN).padStart(4,'0');
   const now=new Date().toISOString().replace('T',' ').slice(0,19);
-  const id = await dbInsert(
-    `INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+  const id = await dbRun(`INSERT INTO ticket (codice,titolo,descrizione,area,fonte,categoria_id,priorita,stato,aperto_da,assegnato_a,creato_il,aggiornato_il) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     [codice,titolo,descrizione||'',area,fonte,categoria_id||null,priorita||'media','nuovo',req.session.userId,assegnato_a||null,now,now]);
-  await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'creazione','Ticket creato',now]);
+  await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'creazione','Ticket creato',now]);
 
   // Email notifica nuovo ticket agli admin/operatori
   try {
     const admins = await dbQuery("SELECT email FROM users WHERE ruolo IN ('admin','operatore') AND attivo=1 AND email IS NOT NULL");
     const aperto_da = await dbQueryOne('SELECT nome,cognome FROM users WHERE id=?',[req.session.userId]);
     const nomeApertura = aperto_da ? aperto_da.nome+' '+aperto_da.cognome : 'Un dipendente';
-    for (const adm of admins) {
-      sendEmail(adm.email, `[HD] Nuovo ticket ${codice}: ${titolo}`, emailNuovoTicket({nome:'Team'}, {codice, titolo, area, priorita:priorita||'medium'}, nomeApertura));
+    for (const admin of admins) {
+      sendEmail(admin.email, `[HD] Nuovo ticket ${codice}: ${titolo}`, emailNuovoTicket({nome:'Team'}, {codice, titolo, area, priorita:priorita||'medium'}, nomeApertura));
     }
   } catch(e) { console.error('Email nuovo ticket error:', e.message); }
 
   if(assegnato_a){
     const op = await dbQueryOne('SELECT nome,cognome FROM users WHERE id=?',[assegnato_a]);
-    if(op) await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'assegnazione',`Assegnato a ${op.nome} ${op.cognome}`,now]);
+    if(op) await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[id,req.session.userId,'assegnazione',`Assegnato a ${op.nome} ${op.cognome}`,now]);
   }
   res.json({id,codice});
 });
@@ -692,7 +607,8 @@ app.patch('/api/tickets/:id', auth, async (req,res) => {
     const risolto=['risolto','chiuso'].includes(stato)?now:t.risolto_il;
     await dbRun(`UPDATE ticket SET stato=?,aggiornato_il=?,risolto_il=? WHERE id=?`,[stato,now,risolto,req.params.id]);
     const statoLabels={nuovo:'NEW',aperto:'OPEN',in_lavorazione:'IN PROGRESS',risolto:'RESOLVED',chiuso:'CLOSED'};
-    await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'stato',`Status: ${statoLabels[stato]||stato}`,now]);
+    await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'stato',`Status: ${statoLabels[stato]||stato}`,now]);
+    // Email notifica cambio stato al dipendente
     const tktOwner = await dbQueryOne('SELECT u.email,u.nome FROM users u JOIN ticket t ON t.aperto_da=u.id WHERE t.id=?',[req.params.id]);
     if (tktOwner && tktOwner.email && req.session.userId !== t.aperto_da) {
       const fullT = await dbQueryOne('SELECT codice,titolo FROM ticket WHERE id=?',[req.params.id]);
@@ -703,15 +619,16 @@ app.patch('/api/tickets/:id', auth, async (req,res) => {
     await dbRun(`UPDATE ticket SET assegnato_a=?,aggiornato_il=? WHERE id=?`,[assegnato_a||null,now,req.params.id]);
     if(assegnato_a){
       const op = await dbQueryOne('SELECT nome,cognome FROM users WHERE id=?',[assegnato_a]);
-      if(op) await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'assegnazione',`Assegnato a ${op.nome} ${op.cognome}`,now]);
+      if(op) await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'assegnazione',`Assegnato a ${op.nome} ${op.cognome}`,now]);
     }
   }
   if(priorita&&priorita!==t.priorita){
     await dbRun(`UPDATE ticket SET priorita=?,aggiornato_il=? WHERE id=?`,[priorita,now,req.params.id]);
-    await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'priorita',`Priorità: ${priorita}`,now]);
+    await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'priorita',`Priorità: ${priorita}`,now]);
   }
   if(nota&&nota.trim()) {
-    await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'nota',nota.trim(),now]);
+    await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,[req.params.id,req.session.userId,'nota',nota.trim(),now]);
+    // Email per comunicazioni [Cliente] rimossa — solo cambio stato notifica via email
   }
   res.json({ok:true});
 });
@@ -757,12 +674,12 @@ app.post('/api/tickets/:id/allegati', auth, upload.array('files', 10), async (re
       fileUrl = `/uploads/${file.filename}`;
     }
 
-    const fileSize = Number(file.size) || 0;
-    const id = await dbInsert(
+    const fileSize = Number(file.size) || 0; // converti BigInt in Number per Turso
+    const id = await dbRun(
       `INSERT INTO allegati (ticket_id,utente_id,filename,originalname,size,mimetype,creato_il) VALUES (?,?,?,?,?,?,?)`,
       [ticketId, req.session.userId, fileUrl || filename, file.originalname, fileSize, file.mimetype, now]
     );
-    await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
+    await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
       [ticketId, req.session.userId, 'allegato', `Allegato aggiunto: ${file.originalname}`, now]);
     inserted.push({ id, originalname: file.originalname, size: fileSize, url: fileUrl });
   }
@@ -772,50 +689,19 @@ app.post('/api/tickets/:id/allegati', auth, upload.array('files', 10), async (re
 app.get('/api/allegati/:id/download', auth, async (req, res) => {
   const a = await dbQueryOne('SELECT * FROM allegati WHERE id=?', [parseInt(req.params.id, 10)]);
   if (!a) return res.status(404).json({ error: 'Allegato non trovato' });
+  // Se è un URL Cloudinary, redirect diretto
   if (a.filename && (a.filename.startsWith('http://') || a.filename.startsWith('https://'))) {
     return res.redirect(a.filename);
   }
   const filePath = path.join(uploadsDir, a.filename);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File non trovato sul server' });
-
-  // Per i video usa streaming con Range requests (necessario per progressbar e seeking)
-  const videoExts = ['.mp4', '.webm', '.mov', '.m4v', '.avi', '.mkv'];
-  const ext = path.extname(a.originalname).toLowerCase();
-  if (videoExts.includes(ext)) {
-    const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = end - start + 1;
-      const file = fs.createReadStream(filePath, { start, end });
-      res.writeHead(206, {
-        'Content-Range':       `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges':       'bytes',
-        'Content-Length':      chunkSize,
-        'Content-Type':        a.mimetype || 'video/webm',
-        'Content-Disposition': `inline; filename="${a.originalname}"`,
-      });
-      file.pipe(res);
-    } else {
-      res.writeHead(200, {
-        'Content-Length':      fileSize,
-        'Content-Type':        a.mimetype || 'video/webm',
-        'Accept-Ranges':       'bytes',
-        'Content-Disposition': `inline; filename="${a.originalname}"`,
-      });
-      fs.createReadStream(filePath).pipe(res);
-    }
-  } else {
-    res.download(filePath, a.originalname);
-  }
+  res.download(filePath, a.originalname);
 });
 
 app.delete('/api/allegati/:id', auth, async (req, res) => {
   const a = await dbQueryOne('SELECT * FROM allegati WHERE id=?', [parseInt(req.params.id, 10)]);
   if (!a) return res.status(404).json({ error: 'Non trovato' });
+  // Rimuovi da Cloudinary se è un URL cloud
   if (useCloudinary && a.filename && a.filename.includes('helpdesk/')) {
     try { await cloudinary.uploader.destroy(a.filename); } catch(e) {}
   } else {
@@ -824,7 +710,7 @@ app.delete('/api/allegati/:id', auth, async (req, res) => {
   }
   await dbRun('DELETE FROM allegati WHERE id=?', [parseInt(req.params.id, 10)]);
   const now = new Date().toISOString().replace('T',' ').slice(0,19);
-  await dbInsert(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
+  await dbRun(`INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)`,
     [a.ticket_id, req.session.userId, 'allegato', `Allegato rimosso: ${a.originalname}`, now]);
   res.json({ ok: true });
 });
@@ -834,7 +720,7 @@ app.get('/api/categorie', auth, async (req,res) => res.json(await dbQuery('SELEC
 app.post('/api/categorie', admin, async (req,res) => {
   const{tipo,nome}=req.body;
   if(!tipo||!nome) return res.status(400).json({error:'Campi mancanti'});
-  res.json({id: await dbInsert('INSERT INTO categorie (tipo,nome) VALUES (?,?)',[tipo,nome])});
+  res.json({id: await dbRun('INSERT INTO categorie (tipo,nome) VALUES (?,?)',[tipo,nome])});
 });
 app.patch('/api/categorie/:id', admin, async (req,res) => {
   await dbRun('UPDATE categorie SET nome=? WHERE id=?',[req.body.nome,req.params.id]);
@@ -851,7 +737,7 @@ app.post('/api/utenti', admin, async (req,res) => {
   const{nome,cognome,email,password,ruolo,area}=req.body;
   if(!nome||!cognome||!email||!password) return res.status(400).json({error:'Campi mancanti'});
   try {
-    res.json({id: await dbInsert('INSERT INTO users (nome,cognome,email,password,ruolo,area) VALUES (?,?,?,?,?,?)',[nome,cognome,email.toLowerCase(),bcrypt.hashSync(password,10),ruolo||'dipendente',area||null])});
+    res.json({id: await dbRun('INSERT INTO users (nome,cognome,email,password,ruolo,area) VALUES (?,?,?,?,?,?)',[nome,cognome,email.toLowerCase(),bcrypt.hashSync(password,10),ruolo||'dipendente',area||null])});
   } catch(e) { res.status(400).json({error:'Email già esistente'}); }
 });
 app.patch('/api/utenti/:id', admin, async (req,res) => {
@@ -873,14 +759,15 @@ app.delete('/api/utenti/:id', admin, async (req,res) => {
 // ── Stats ─────────────────────────────────────────────────────────────────────
 app.get('/api/stats', auth, async (req,res) => {
   res.json({
-    aperti:     (await dbQueryOne(`SELECT COUNT(*) AS c FROM ticket WHERE stato NOT IN ('risolto','chiuso')`)).c,
-    alta_prio:  (await dbQueryOne(`SELECT COUNT(*) AS c FROM ticket WHERE priorita IN ('high','critical') AND stato NOT IN ('risolto','chiuso')`)).c,
-    oggi:       (await dbQueryOne(`SELECT COUNT(*) AS c FROM ticket WHERE stato IN ('risolto','chiuso') AND CAST(risolto_il AS DATE)=CAST(GETDATE() AS DATE)`)).c,
-    nuovi_oggi: (await dbQueryOne(`SELECT COUNT(*) AS c FROM ticket WHERE CAST(creato_il AS DATE)=CAST(GETDATE() AS DATE)`)).c,
-    per_area:   await dbQuery(`SELECT area,COUNT(*) AS c FROM ticket WHERE stato NOT IN ('risolto','chiuso') GROUP BY area ORDER BY c DESC`),
-    per_stato:  await dbQuery(`SELECT stato,COUNT(*) AS c FROM ticket GROUP BY stato`)
+    aperti:     (await dbQueryOne(`SELECT COUNT(*) as c FROM ticket WHERE stato NOT IN ('risolto','chiuso')`)).c,
+    alta_prio:  (await dbQueryOne(`SELECT COUNT(*) as c FROM ticket WHERE priorita IN ('high','critical') AND stato NOT IN ('risolto','chiuso')`)).c,
+    oggi:       (await dbQueryOne(`SELECT COUNT(*) as c FROM ticket WHERE stato IN ('risolto','chiuso') AND DATE(risolto_il)=DATE('now')`)).c,
+    nuovi_oggi: (await dbQueryOne(`SELECT COUNT(*) as c FROM ticket WHERE DATE(creato_il)=DATE('now')`)).c,
+    per_area:   await dbQuery(`SELECT area,COUNT(*) as c FROM ticket WHERE stato NOT IN ('risolto','chiuso') GROUP BY area ORDER BY c DESC`),
+    per_stato:  await dbQuery(`SELECT stato,COUNT(*) as c FROM ticket GROUP BY stato`)
   });
 });
+
 
 // ── Aree ─────────────────────────────────────────────────────────────────────
 app.get('/api/aree', auth, async (req,res) => {
@@ -890,7 +777,7 @@ app.post('/api/aree', admin, async (req,res) => {
   const {nome,ordine} = req.body;
   if(!nome) return res.status(400).json({error:'Nome obbligatorio'});
   try {
-    const id = await dbInsert('INSERT INTO aree (nome,ordine) VALUES (?,?)',[nome.trim(),ordine||0]);
+    const id = await dbRun('INSERT INTO aree (nome,ordine) VALUES (?,?)',[nome.trim(),ordine||0]);
     res.json({id});
   } catch(e) { res.status(400).json({error:'Area già esistente'}); }
 });
@@ -906,13 +793,12 @@ app.delete('/api/aree/:id', admin, async (req,res) => {
 
 // ── Annunci ───────────────────────────────────────────────────────────────────
 app.get('/api/annunci', auth, async (req,res) => {
-  // TOP 5 equivalent in T-SQL
-  res.json(await dbQuery('SELECT TOP 5 * FROM annunci WHERE attivo=1 ORDER BY creato_il DESC'));
+  res.json(await dbQuery('SELECT * FROM annunci WHERE attivo=1 ORDER BY creato_il DESC LIMIT 5'));
 });
 app.post('/api/annunci', admin, async (req,res) => {
   const {titolo,testo} = req.body;
   if(!titolo||!testo) return res.status(400).json({error:'Campi mancanti'});
-  res.json({id: await dbInsert('INSERT INTO annunci (titolo,testo,creato_da) VALUES (?,?,?)',[titolo,testo,req.session.userId])});
+  res.json({id: await dbRun('INSERT INTO annunci (titolo,testo,creato_da) VALUES (?,?,?)',[titolo,testo,req.session.userId])});
 });
 app.delete('/api/annunci/:id', admin, async (req,res) => {
   await dbRun('UPDATE annunci SET attivo=0 WHERE id=?',[req.params.id]);
@@ -926,7 +812,7 @@ app.get('/api/faq', auth, async (req,res) => {
 app.post('/api/faq', admin, async (req,res) => {
   const {domanda,risposta,ordine} = req.body;
   if(!domanda||!risposta) return res.status(400).json({error:'Campi mancanti'});
-  res.json({id: await dbInsert('INSERT INTO faq (domanda,risposta,ordine) VALUES (?,?,?)',[domanda,risposta,ordine||0])});
+  res.json({id: await dbRun('INSERT INTO faq (domanda,risposta,ordine) VALUES (?,?,?)',[domanda,risposta,ordine||0])});
 });
 app.patch('/api/faq/:id', admin, async (req,res) => {
   const {domanda,risposta,ordine,attivo} = req.body;
@@ -939,9 +825,10 @@ app.delete('/api/faq/:id', admin, async (req,res) => {
 });
 
 // ── Feedback ──────────────────────────────────────────────────────────────────
+// Tutte le valutazioni (per admin)
 app.get('/api/feedback/all', admin, async (req,res) => {
   const rows = await dbQuery(
-    `SELECT f.*, t.codice, t.titolo, u.nome+' '+u.cognome AS utente_nome
+    `SELECT f.*, t.codice, t.titolo, u.nome||' '||u.cognome as utente_nome
      FROM feedback f
      JOIN ticket t ON t.id = f.ticket_id
      LEFT JOIN users u ON u.id = f.utente_id
@@ -954,34 +841,18 @@ app.get('/api/feedback/:ticketId', auth, async (req,res) => {
   const f = await dbQueryOne('SELECT * FROM feedback WHERE ticket_id=?',[req.params.ticketId]);
   res.json(f||null);
 });
-
 app.post('/api/feedback', auth, async (req,res) => {
   const {ticket_id,voto,commento} = req.body;
   if(!ticket_id||!voto) return res.status(400).json({error:'Campi mancanti'});
+  // Verifica che il ticket sia dell'utente
   const t = await dbQueryOne('SELECT id FROM ticket WHERE id=? AND aperto_da=?',[ticket_id,req.session.userId]);
   if(!t) return res.status(403).json({error:'Non autorizzato'});
   try {
-    // MERGE replaces INSERT OR REPLACE for Azure SQL
-    await pool.request()
-      .input('ticket_id', ticket_id)
-      .input('utente_id', req.session.userId)
-      .input('voto', voto)
-      .input('commento', commento||'')
-      .query(`
-        MERGE feedback AS target
-        USING (SELECT @ticket_id AS ticket_id) AS source ON target.ticket_id = source.ticket_id
-        WHEN MATCHED THEN
-          UPDATE SET utente_id=@utente_id, voto=@voto, commento=@commento,
-                     creato_il=FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss')
-        WHEN NOT MATCHED THEN
-          INSERT (ticket_id,utente_id,voto,commento)
-          VALUES (@ticket_id,@utente_id,@voto,@commento);
-      `);
-    const inserted = await dbQueryOne('SELECT id FROM feedback WHERE ticket_id=?',[ticket_id]);
-    const id = inserted ? inserted.id : null;
+    const id = await dbRun('INSERT OR REPLACE INTO feedback (ticket_id,utente_id,voto,commento) VALUES (?,?,?,?)',[ticket_id,req.session.userId,voto,commento||'']);
+    // Crea attività per notificare l'admin
     const now = new Date().toISOString().replace('T',' ').slice(0,19);
     const stelle = '★'.repeat(voto) + '☆'.repeat(5-voto);
-    await dbInsert('INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)',
+    await dbRun('INSERT INTO attivita (ticket_id,utente_id,tipo,testo,creato_il) VALUES (?,?,?,?,?)',
       [ticket_id, req.session.userId, 'feedback', `Valutazione: ${stelle} (${voto}/5)`, now]);
     res.json({id});
   } catch(e) { res.status(400).json({error:e.message}); }
@@ -991,10 +862,10 @@ app.post('/api/feedback', auth, async (req,res) => {
 app.get('/api/attivita/settimana', auth, async (req,res) => {
   const userId = req.session.userId;
   const rows = await dbQuery(
-    `SELECT CAST(creato_il AS DATE) AS giorno, COUNT(*) AS c
+    `SELECT DATE(creato_il) as giorno, COUNT(*) as c
      FROM ticket WHERE aperto_da=?
-     AND creato_il >= FORMAT(DATEADD(day,-6,GETDATE()),'yyyy-MM-dd')
-     GROUP BY CAST(creato_il AS DATE)`,
+     AND creato_il >= DATE('now','-6 days')
+     GROUP BY DATE(creato_il)`,
     [userId]
   );
   res.json(rows);
