@@ -11,7 +11,6 @@ const streamifier = require('streamifier');
 const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const sql = require('mssql');
-const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -537,42 +536,6 @@ app.get('/auth/google/callback',
     res.redirect('/');
   }
 );
-
-// ── SSO dalla Dashboard Hub ──────────────────────────────────────────────────
-// Riceve un JWT firmato dalla dashboard, verifica l'email nel DB e crea la sessione.
-// La dashboard usa lo stesso JWT_SECRET → il token è affidabile.
-app.get('/auth/sso', async (req, res) => {
-  const { token } = req.query;
-  if (!token) return res.redirect('/?error=sso_token_mancante');
-
-  try {
-    // Verifica e decodifica il token firmato dalla dashboard
-    const secret = process.env.JWT_SECRET || process.env.SESSION_SECRET;
-    const payload = jwt.verify(token, secret);
-    const email = (payload.email || '').toLowerCase().trim();
-    if (!email) return res.redirect('/?error=sso_email_mancante');
-
-    // Cerca l'utente nel database tramite email
-    const user = await dbQueryOne(
-      'SELECT * FROM users WHERE email=? AND attivo=1',
-      [email]
-    );
-
-    if (!user) {
-      console.warn('[SSO] Utente non trovato per email:', email);
-      return res.redirect('/?error=sso_utente_non_trovato');
-    }
-
-    // Crea la sessione — esattamente come fa il login normale
-    req.session.userId = user.id;
-    console.log('[SSO] Login automatico per:', email, '→ userId:', user.id);
-    res.redirect('/');
-
-  } catch (err) {
-    console.error('[SSO] Errore verifica token:', err.message);
-    res.redirect('/?error=sso_token_non_valido');
-  }
-});
 
 // ── Tickets ───────────────────────────────────────────────────────────────────
 app.get('/api/tickets', auth, async (req,res) => {
