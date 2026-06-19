@@ -587,10 +587,23 @@ app.get('/api/dashboard/stats', async (req, res) => {
     const email = (payload.email || '').toLowerCase().trim();
     if (!email) return res.status(401).json({ error: 'Email mancante' });
 
-    // Conta ticket aperti (stato != 'chiuso' e != 'risolto')
-    const row = await dbQueryOne(
-      "SELECT COUNT(*) AS c FROM ticket WHERE stato NOT IN ('chiuso','risolto')"
-    );
+    // Trova l'utente per ruolo
+    const user = await dbQueryOne('SELECT id, ruolo FROM users WHERE email=?', [email]);
+    if (!user) return res.json({ open: 0, assigned: 0 });
+
+    let row;
+    if (user.ruolo === 'dipendente') {
+      // Dipendente: solo i ticket aperti DA lui
+      row = await dbQueryOne(
+        "SELECT COUNT(*) AS c FROM ticket WHERE stato NOT IN ('chiuso','risolto') AND aperto_da=?",
+        [user.id]
+      );
+    } else {
+      // Admin/operatore: tutti i ticket aperti
+      row = await dbQueryOne(
+        "SELECT COUNT(*) AS c FROM ticket WHERE stato NOT IN ('chiuso','risolto')"
+      );
+    }
     res.json({ open: row?.c || 0, assigned: 0 });
   } catch(e) {
     console.error('[dashboard/stats] errore:', e.message);
