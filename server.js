@@ -574,6 +574,30 @@ app.get('/auth/sso', async (req, res) => {
   }
 });
 
+// ── API Stats per Dashboard Hub ──────────────────────────────────────────────
+// Accetta JWT firmato dalla dashboard, restituisce conteggio ticket aperti
+app.get('/api/dashboard/stats', async (req, res) => {
+  try {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Token mancante' });
+
+    const secret = process.env.JWT_SECRET || process.env.SESSION_SECRET;
+    const payload = jwt.verify(token, secret);
+    const email = (payload.email || '').toLowerCase().trim();
+    if (!email) return res.status(401).json({ error: 'Email mancante' });
+
+    // Conta ticket aperti (stato != 'chiuso' e != 'risolto')
+    const row = await dbQueryOne(
+      "SELECT COUNT(*) AS c FROM ticket WHERE stato NOT IN ('chiuso','risolto')"
+    );
+    res.json({ open: row?.c || 0, assigned: 0 });
+  } catch(e) {
+    console.error('[dashboard/stats] errore:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Tickets ───────────────────────────────────────────────────────────────────
 app.get('/api/tickets', auth, async (req,res) => {
   const {area,stato,priorita,q,assegnato_a,aperto_da,fonte}=req.query;
